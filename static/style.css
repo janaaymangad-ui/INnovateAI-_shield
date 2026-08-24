@@ -367,5 +367,11 @@ hr {
         padding: 17px;
 
     }
+    .site-footer {
+    text-align: center;
+    padding: 20px;
+    margin-top: 40px;
+    font-size: 14px;
+}
 
 }
