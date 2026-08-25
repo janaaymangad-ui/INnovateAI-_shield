@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import threading
 import requests
 
 from flask import Flask, request, jsonify, render_template
@@ -7,6 +9,14 @@ from dotenv import load_dotenv
 
 from google import genai
 from google.genai import types
+from google.genai import errors
+
+try:
+    from google.api_core.exceptions import ResourceExhausted
+except ImportError:
+    class ResourceExhausted(Exception):
+        """Fallback ResourceExhausted exception class."""
+        pass
 
 
 # ==================================================
@@ -27,6 +37,150 @@ if not api_key:
 client = genai.Client(
     api_key=api_key
 )
+
+
+# ==================================================
+# RATE LIMITING & RETRY CONFIGURATION
+# ==================================================
+
+# Free tier rate limit: 20 requests per minute (60s / 20 = 3.0s minimum).
+# We enforce a 3.5s delay between consecutive calls to stay safely below the limit.
+CALL_DELAY_SECONDS = 3.5
+INITIAL_RETRY_DELAY = 30.0  # Wait at least 30 seconds on ResourceExhausted/429 before retrying
+MAX_RETRIES = 3
+BACKOFF_FACTOR = 2.0
+GEMINI_MODEL = "gemini-3.6-flash"
+
+_last_call_time = 0.0
+_call_lock = threading.Lock()
+
+
+def wait_for_rate_limit():
+    """
+    Ensures an appropriate delay between consecutive Gemini API calls
+    to prevent exceeding the 20 requests/minute rate limit.
+    """
+    global _last_call_time
+
+    with _call_lock:
+        now = time.time()
+        elapsed = now - _last_call_time
+
+        if elapsed < CALL_DELAY_SECONDS:
+            sleep_time = CALL_DELAY_SECONDS - elapsed
+            time.sleep(sleep_time)
+
+        _last_call_time = time.time()
+
+
+def is_rate_limit_error(exception: Exception) -> bool:
+    """
+    Determines if an exception represents a 429 Resource Exhausted / Rate Limit error.
+    """
+    if isinstance(exception, ResourceExhausted):
+        return True
+
+    if isinstance(exception, (errors.APIError, errors.ClientError)):
+        if getattr(exception, "code", None) == 429:
+            return True
+        if getattr(exception, "status", None) == "RESOURCE_EXHAUSTED":
+            return True
+
+    err_str = str(exception).upper()
+    err_type = type(exception).__name__.upper()
+
+    if (
+        "RESOURCE_EXHAUSTED" in err_str
+        or "429" in err_str
+        or "RATE LIMIT" in err_str
+        or "RESOURCEEXHAUSTED" in err_type
+        or "RESOURCE_EXHAUSTED" in err_type
+    ):
+        return True
+
+    return False
+
+
+def extract_retry_delay(exception: Exception, default_delay: float = INITIAL_RETRY_DELAY) -> float:
+    """
+    Extracts recommended retryDelay from API error response details if present,
+    otherwise returns default_delay.
+    """
+    delay = default_delay
+
+    try:
+        details_obj = getattr(exception, "details", None)
+
+        if isinstance(details_obj, dict):
+            error_data = details_obj.get("error", details_obj)
+
+            for item in error_data.get("details", []):
+                if isinstance(item, dict) and "retryDelay" in item:
+                    raw_delay = str(item["retryDelay"]).rstrip("s")
+                    delay = max(delay, float(raw_delay))
+                    return delay
+
+    except Exception:
+        pass
+
+    return delay
+
+
+def call_gemini_with_retry(
+    contents,
+    model=GEMINI_MODEL,
+    config=None,
+    max_retries=MAX_RETRIES,
+    initial_retry_delay=INITIAL_RETRY_DELAY,
+    backoff_factor=BACKOFF_FACTOR
+):
+    """
+    Executes client.models.generate_content with rate limiting pacing and exponential backoff.
+    Waits 30 seconds before retrying automatically upon encountering ResourceExhausted/429.
+    """
+    retry_delay = initial_retry_delay
+
+    for attempt in range(1, max_retries + 1):
+        wait_for_rate_limit()
+
+        try:
+            if config:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                )
+            else:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=contents
+                )
+
+            return response
+
+        except (ResourceExhausted, errors.APIError, errors.ClientError, Exception) as e:
+            if is_rate_limit_error(e):
+                actual_wait = extract_retry_delay(e, retry_delay)
+                actual_wait = max(actual_wait, retry_delay)
+
+                print(
+                    f"[Rate Limit] Hit 429/ResourceExhausted on attempt {attempt}/{max_retries}: {e}"
+                )
+
+                if attempt < max_retries:
+                    print(
+                        f"[Retry] Waiting {actual_wait:.1f}s before retrying Gemini API call..."
+                    )
+                    time.sleep(actual_wait)
+                    retry_delay = max(retry_delay * backoff_factor, actual_wait * backoff_factor)
+                    continue
+                else:
+                    print(
+                        f"[Rate Limit] Maximum retries ({max_retries}) exceeded for Gemini API call."
+                    )
+                    raise
+            else:
+                raise
 
 
 # ==================================================
@@ -219,9 +373,9 @@ Rules:
         )
 
 
-        response = client.models.generate_content(
+        response = call_gemini_with_retry(
 
-            model="gemini-3.6-flash",
+            model=GEMINI_MODEL,
 
             contents=prompt,
 
@@ -720,9 +874,9 @@ Announcement:
 
     try:
 
-        response = client.models.generate_content(
+        response = call_gemini_with_retry(
 
-            model="gemini-3.6-flash",
+            model=GEMINI_MODEL,
 
             contents=prompt
         )
@@ -871,6 +1025,11 @@ Announcement:
 
 
     except Exception as e:
+        if is_rate_limit_error(e):
+            return jsonify({
+                "error":
+                    "Gemini API rate limit was exceeded. Please wait a moment and try again."
+            }), 429
 
         return jsonify({
 
@@ -884,9 +1043,8 @@ Announcement:
 # RUN
 # ==================================================
 
-import os
+if __name__ == "__main__":
 
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 5000))
-    app.run(host='0.0.0.0', port=port)
-    
+    app.run(
+        debug=True
+    )
