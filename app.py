@@ -780,43 +780,45 @@ def home():
 )
 def analyze():
 
-    data = request.get_json()
+    try:
+
+        data = request.get_json(silent=True) or {}
 
 
-    announcement = data.get(
-        "announcement",
-        ""
-    ).strip()
+        announcement = data.get(
+            "announcement",
+            ""
+        ).strip()
 
 
-    link = data.get(
-        "link",
-        ""
-    ).strip()
+        link = data.get(
+            "link",
+            ""
+        ).strip()
 
 
-    if not announcement:
+        if not announcement:
 
-        return jsonify({
-            "error":
-                "Please enter an announcement."
-        }), 400
-
-
-    # ------------------------------------------
-    # Check link
-    # ------------------------------------------
-
-    link_info = check_link(
-        link
-    )
+            return jsonify({
+                "error":
+                    "Please enter an announcement."
+            }), 400
 
 
-    # ------------------------------------------
-    # Gemini analysis
-    # ------------------------------------------
+        # ------------------------------------------
+        # Check link
+        # ------------------------------------------
 
-    prompt = f"""
+        link_info = check_link(
+            link
+        )
+
+
+        # ------------------------------------------
+        # Gemini analysis
+        # ------------------------------------------
+
+        prompt = f"""
 
 You are the announcement analysis engine
 for INnovateAI Shield.
@@ -871,8 +873,6 @@ Announcement:
 {announcement}
 """
 
-
-    try:
 
         response = call_gemini_with_retry(
 
@@ -1037,6 +1037,17 @@ Announcement:
                 str(e)
 
         }), 500
+
+
+# ==================================================
+# GLOBAL ERROR HANDLERS
+# ==================================================
+
+@app.errorhandler(500)
+def internal_error(e):
+    return jsonify({
+        "error": "An internal server error occurred. Please try again."
+    }), 500
 
 
 # ==================================================
